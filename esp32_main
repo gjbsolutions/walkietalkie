@@ -1,0 +1,367 @@
+# main.py -- ESP-NOW encrypted walkie talkie. ESP32-C3, MicroPython. SAME file on every unit.
+#
+# Button held  -> TRANSMIT: mic -> IMA-ADPCM (4 bit) -> AES-256-CTR + HMAC-SHA256 -> ESP-NOW broadcast.
+# Button free  -> LISTEN:   ESP-NOW broadcast -> verify -> decrypt -> ADPCM -> speaker.
+# One way, no ACK, no retransmit: a lost frame is a 20 ms gap.
+#
+# Wiring (ESP32-C3 SuperMini, change below if needed). Mic and amp share BCLK/LRCLK because the
+# C3 has ONE I2S peripheral: the code re-initialises it as RX when you talk, as TX when you listen.
+#   INMP441     : SCK->BCLK  WS->LRCLK  SD->MIC_SD   L/R->GND  VDD->3V3  GND->GND
+#   MAX98357A   : BCLK->BCLK LRC->LRCLK DIN->AMP_DIN VIN->5V/3V3  GND->GND
+#   Button      : BTN -> GND (internal pull-up)
+#
+# Wire format (183 bytes):  [sid 8][seq 4 BE][ciphertext 163][tag 8]
+#   plaintext = [adpcm_pred int16 LE][adpcm_index u8][160 bytes = 320 samples, 20 ms]
+#   iv        = sid | seq | 00 00 00 00      (unique per packet, never reused with the same key)
+#   tag       = HMAC-SHA256(mac_key, sid|seq|ciphertext)[:8]   (encrypt-then-MAC)
+# Each packet carries the ADPCM state, so any packet decodes on its own (loss tolerant).
+
+import os
+import time
+import array
+import struct
+import hashlib
+import micropython
+import network
+import espnow
+import cryptolib
+from machine import Pin, I2S
+
+# ======================= CONFIG =======================
+# 32-byte shared key, 64 hex chars. Generate one on a PC:  python -c "import os;print(os.urandom(32).hex())"
+KEY_HEX = "0000000000000000000000000000000000000000000000000000000000000000"
+
+CHANNEL = 1             # Wi-Fi channel, same on all units
+LONG_RANGE = False      # True = ESP-NOW LR 500 kbps (more range, Espressif<->Espressif only, same on all units)
+TX_POWER = 0            # 0 = default; else units of 0.25 dBm (e.g. 80 = 20 dBm)
+
+BCLK, LRCLK, MIC_SD, AMP_DIN = 4, 5, 6, 7
+BTN = 10                # push-to-talk, active low
+LED = 8                 # on while transmitting
+LED_ON = 0              # 0 = active-low LED (SuperMini), 1 = active-high
+
+SAMPLE_RATE = 16000
+FRAME = 320             # samples per packet (20 ms). Keep even. 320 -> 183-byte packets (max 250)
+MIC_SHIFT = 14          # 16 = no gain, 15 = x2, 14 = x4, 13 = x8 ... raise gain if the voice is quiet
+VOL_SHIFT = 1           # speaker gain as left-shift: 0 = x1, 1 = x2, 2 = x4 (mono goes to one channel only)
+MIC_WARMUP = 4          # frames discarded after mic start (INMP441 needs ~80 ms to settle)
+PRIME_FRAMES = 2        # frames of silence queued before playback starts = jitter margin (40 ms)
+HANGOVER_MS = 150       # no packet for this long = end of transmission
+# ======================================================
+
+KEY = bytes.fromhex(KEY_HEX)
+if len(KEY) != 32 or KEY == bytes(32):
+    raise ValueError("Set KEY_HEX to a random 32-byte key (64 hex chars)")
+
+HDR = 12
+BODY = 3 + FRAME // 2
+TAG = 8
+PKT_LEN = HDR + BODY + TAG
+BCAST = b'\xff' * 6
+
+# ---------------- crypto ----------------
+_EK = hashlib.sha256(KEY + b'walkie-enc').digest()
+_MK = hashlib.sha256(KEY + b'walkie-mac').digest()
+_IPAD = bytes([b ^ 0x36 for b in _MK] + [0x36] * 32)
+_OPAD = bytes([b ^ 0x5C for b in _MK] + [0x5C] * 32)
+
+
+def _tag(data):
+    h = hashlib.sha256(_IPAD)
+    h.update(data)
+    o = hashlib.sha256(_OPAD)
+    o.update(h.digest())
+    return o.digest()[:TAG]
+
+
+def _ctr(hdr, data):
+    # CTR is symmetric: the same call encrypts and decrypts. mode 6 = CTR.
+    return cryptolib.aes(_EK, 6, hdr + b'\x00\x00\x00\x00').encrypt(data)
+
+
+# ---------------- IMA ADPCM ----------------
+_STEP = array.array('H', [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
+    73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408,
+    449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630,
+    9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794,
+    32767])
+
+
+@micropython.viper
+def _enc(src, n: int, shift: int, out, st, tbl) -> int:
+    # src: n int32 mic samples (24-bit left-aligned). out: n/2 bytes. st: int32[2] = [pred, index]
+    s = ptr32(src)
+    o = ptr8(out)
+    t = ptr32(st)
+    stp = ptr16(tbl)
+    pred = int(t[0])
+    idx = int(t[1])
+    i = 0
+    while i < n:
+        x = int(s[i]) >> shift
+        if x > 32767:
+            x = 32767
+        if x < -32768:
+            x = -32768
+        step = int(stp[idx])
+        d = x - pred
+        code = 0
+        if d < 0:
+            code = 8
+            d = -d
+        diff = step >> 3
+        if d >= step:
+            code |= 4
+            d -= step
+            diff += step
+        step >>= 1
+        if d >= step:
+            code |= 2
+            d -= step
+            diff += step
+        step >>= 1
+        if d >= step:
+            code |= 1
+            diff += step
+        if code & 8:
+            pred -= diff
+        else:
+            pred += diff
+        if pred > 32767:
+            pred = 32767
+        if pred < -32768:
+            pred = -32768
+        c7 = code & 7
+        if c7 < 4:
+            idx -= 1
+        else:
+            idx += (c7 - 3) * 2
+        if idx < 0:
+            idx = 0
+        if idx > 88:
+            idx = 88
+        if i & 1:
+            o[i >> 1] = int(o[i >> 1]) | (code << 4)
+        else:
+            o[i >> 1] = code
+        i += 1
+    t[0] = pred
+    t[1] = idx
+    return 0
+
+
+@micropython.viper
+def _dec(inp, n: int, out, st, tbl, gain: int) -> int:
+    # inp: n/2 bytes. out: n int16 samples. st: int32[2] = [pred, index] (input state)
+    b = ptr8(inp)
+    o = ptr16(out)
+    t = ptr32(st)
+    stp = ptr16(tbl)
+    pred = int(t[0])
+    idx = int(t[1])
+    i = 0
+    while i < n:
+        v = int(b[i >> 1])
+        if i & 1:
+            code = v >> 4
+        else:
+            code = v & 15
+        step = int(stp[idx])
+        diff = step >> 3
+        if code & 4:
+            diff += step
+        if code & 2:
+            diff += step >> 1
+        if code & 1:
+            diff += step >> 2
+        if code & 8:
+            pred -= diff
+        else:
+            pred += diff
+        if pred > 32767:
+            pred = 32767
+        if pred < -32768:
+            pred = -32768
+        c7 = code & 7
+        if c7 < 4:
+            idx -= 1
+        else:
+            idx += (c7 - 3) * 2
+        if idx < 0:
+            idx = 0
+        if idx > 88:
+            idx = 88
+        y = pred << gain
+        if y > 32767:
+            y = 32767
+        if y < -32768:
+            y = -32768
+        o[i] = y
+        i += 1
+    return 0
+
+
+# ---------------- hardware (created in setup()) ----------------
+e = btn = led = None
+sid = b''
+seq = 0
+enc_st = array.array('i', [0, 0])
+dec_st = array.array('i', [0, 0])
+raw = adp = pcm = pcm_mv = silence = None
+seen = {}               # sid -> highest seq accepted (replay protection), max 8 senders
+
+
+def setup():
+    global e, btn, led, sid, raw, adp, pcm, pcm_mv, silence
+    sta = network.WLAN(network.STA_IF)
+    sta.active(True)
+    try:
+        if LONG_RANGE:
+            sta.config(protocol=network.MODE_11B | network.MODE_11G |
+                                network.MODE_11N | network.MODE_LR)
+        sta.config(channel=CHANNEL)
+        if TX_POWER:
+            sta.config(txpower=TX_POWER)
+    except Exception:
+        pass
+    e = espnow.ESPNow()
+    e.config(rxbuf=2048)
+    e.active(True)
+    if LONG_RANGE:
+        try:
+            e.config(rate=0x2A)         # LR 500 kbps, as in the file-transfer project
+        except Exception:
+            pass
+    try:
+        e.add_peer(BCAST)
+    except Exception:
+        pass
+    btn = Pin(BTN, Pin.IN, Pin.PULL_UP)
+    led = Pin(LED, Pin.OUT, value=1 - LED_ON)
+    sid = os.urandom(8)
+    raw = bytearray(FRAME * 4)
+    adp = bytearray(FRAME // 2)
+    pcm = bytearray(FRAME * 2)
+    pcm_mv = memoryview(pcm)
+    silence = bytes(FRAME * 2)
+
+
+def pressed():
+    if btn.value():
+        return False
+    time.sleep_ms(15)
+    return not btn.value()
+
+
+# ---------------- transmit ----------------
+def send_frame(pred, idx):
+    global seq, sid
+    if seq >= 0xFFFFFFFF:               # never reuse an IV: new random sid
+        sid = os.urandom(8)
+        seq = 0
+    hdr = sid + struct.pack('>I', seq)
+    seq += 1
+    pkt = hdr + _ctr(hdr, struct.pack('<hB', pred, idx) + adp)
+    pkt += _tag(pkt)
+    try:
+        e.send(BCAST, pkt, True)
+    except OSError:
+        pass                            # no ACK on broadcast; a failed frame is just a gap
+
+
+def talk():
+    led.value(LED_ON)
+    mic = I2S(0, sck=Pin(BCLK), ws=Pin(LRCLK), sd=Pin(MIC_SD), mode=I2S.RX, bits=32,
+              format=I2S.MONO, rate=SAMPLE_RATE, ibuf=4096)
+    enc_st[0] = 0
+    enc_st[1] = 0
+    for _ in range(MIC_WARMUP):
+        mic.readinto(raw)
+    released = 0
+    while released < 3:                 # button must read "free" for 3 frames (60 ms): debounce
+        released = released + 1 if btn.value() else 0
+        mic.readinto(raw)
+        p0 = enc_st[0]
+        i0 = enc_st[1]
+        _enc(raw, FRAME, MIC_SHIFT, adp, enc_st, _STEP)
+        send_frame(p0, i0)
+    mic.deinit()
+    led.value(1 - LED_ON)
+
+
+# ---------------- receive ----------------
+def open_pkt(m):
+    # -> (sid, seq, pred, idx, adpcm bytes) or None
+    if len(m) != PKT_LEN:
+        return None
+    mv = memoryview(m)
+    if _tag(mv[:PKT_LEN - TAG]) != bytes(mv[PKT_LEN - TAG:]):
+        return None                     # wrong key or tampered
+    s = bytes(mv[:8])
+    n = struct.unpack('>I', mv[8:12])[0]
+    last = seen.get(s)
+    if last is not None and n <= last:
+        return None                     # replayed or late
+    if last is None and len(seen) >= 8:
+        del seen[next(iter(seen))]
+    seen[s] = n
+    pt = _ctr(bytes(mv[:HDR]), mv[HDR:PKT_LEN - TAG])
+    idx = pt[2]
+    if idx > 88:
+        return None
+    return s, n, struct.unpack_from('<h', pt, 0)[0], idx, memoryview(pt)[3:]
+
+
+def new_spk():
+    spk = I2S(0, sck=Pin(BCLK), ws=Pin(LRCLK), sd=Pin(AMP_DIN), mode=I2S.TX, bits=16,
+              format=I2S.MONO, rate=SAMPLE_RATE, ibuf=4096)
+    for _ in range(PRIME_FRAMES):
+        spk.write(silence)
+    return spk
+
+
+def listen():
+    spk = None
+    cur = None                          # [sid, last seq] of the stream being played
+    last_rx = 0
+    while not pressed():
+        _, msg = e.irecv(10)
+        now = time.ticks_ms()
+        if msg:
+            r = open_pkt(msg)
+            if r and (cur is None or cur[0] == r[0]):
+                if cur is None:
+                    cur = [r[0], r[1] - 1]
+                    spk = new_spk()
+                gap = r[1] - cur[1] - 1
+                if 0 < gap <= 3:        # keep timing across lost frames
+                    for _ in range(gap):
+                        spk.write(silence)
+                cur[1] = r[1]
+                dec_st[0] = r[2]
+                dec_st[1] = r[3]
+                _dec(r[4], FRAME, pcm, dec_st, _STEP, VOL_SHIFT)
+                spk.write(pcm_mv)
+                last_rx = now
+        elif spk and time.ticks_diff(now, last_rx) > HANGOVER_MS:
+            spk.deinit()                # stops BCLK: MAX98357 mutes, no hiss between transmissions
+            spk = None
+            cur = None
+    if spk:
+        spk.deinit()
+
+
+def main():
+    setup()
+    while True:
+        if pressed():
+            talk()
+        else:
+            listen()
+
+
+if __name__ == "__main__":
+    main()
+
