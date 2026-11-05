@@ -12,9 +12,14 @@
 #
 # Wire format (183 bytes):  [sid 8][seq 4 BE][ciphertext 163][tag 8]
 #   plaintext = [adpcm_pred int16 LE][adpcm_index u8][160 bytes = 320 samples, 20 ms]
-#   iv        = sid | seq | 00 00 00 00      (unique per packet, never reused with the same key)
+#   counter block i = sid | seq | i (u32 BE), i = 0,1,2...   (unique per packet and block, never reused
+#                     with the same key).  Keystream = AES-256-ECB(counter blocks); ciphertext = plaintext
+#                     XOR keystream.  That IS AES-CTR, built on ECB because this MicroPython build's
+#                     cryptolib has no CTR mode (aes(key, 6, iv) raises "ValueError: mode").
 #   tag       = HMAC-SHA256(mac_key, sid|seq|ciphertext)[:8]   (encrypt-then-MAC)
 # Each packet carries the ADPCM state, so any packet decodes on its own (loss tolerant).
+#
+# NOTE: the counter-block layout differs from the old "mode 6" version, so every unit must run this version.
 
 import os
 import time
@@ -29,11 +34,11 @@ from machine import Pin, I2S
 
 # ======================= CONFIG =======================
 # 32-byte shared key, 64 hex chars. Generate one on a PC:  python -c "import os;print(os.urandom(32).hex())"
-KEY_HEX = "0000000000000000000000000000000000000000000000000000000000000000"
+KEY_HEX = "f803703aa2d6b3bdd660e3c095f2a4e95a11b6bcf87cda30f10d90cae8a158ab"
 
 CHANNEL = 1             # Wi-Fi channel, same on all units
 LONG_RANGE = False      # True = ESP-NOW LR 500 kbps (more range, Espressif<->Espressif only, same on all units)
-TX_POWER = 0            # 0 = default; else units of 0.25 dBm (e.g. 80 = 20 dBm)
+TX_POWER_DBM = 2        # transmit power in dBm (MicroPython takes dBm, range 2..20); 0 = leave driver default
 
 BCLK, LRCLK, MIC_SD, AMP_DIN = 4, 5, 6, 7
 BTN = 10                # push-to-talk, active low
@@ -64,6 +69,7 @@ _EK = hashlib.sha256(KEY + b'walkie-enc').digest()
 _MK = hashlib.sha256(KEY + b'walkie-mac').digest()
 _IPAD = bytes([b ^ 0x36 for b in _MK] + [0x36] * 32)
 _OPAD = bytes([b ^ 0x5C for b in _MK] + [0x5C] * 32)
+_ecb = cryptolib.aes(_EK, 1)            # mode 1 = ECB (stateless, so one object serves every packet)
 
 
 def _tag(data):
@@ -74,9 +80,30 @@ def _tag(data):
     return o.digest()[:TAG]
 
 
+@micropython.viper
+def _xor(a, b, out, n: int) -> int:
+    x = ptr8(a)
+    y = ptr8(b)
+    o = ptr8(out)
+    i = 0
+    while i < n:
+        o[i] = int(x[i]) ^ int(y[i])
+        i += 1
+    return 0
+
+
 def _ctr(hdr, data):
-    # CTR is symmetric: the same call encrypts and decrypts. mode 6 = CTR.
-    return cryptolib.aes(_EK, 6, hdr + b'\x00\x00\x00\x00').encrypt(data)
+    # AES-CTR built on ECB. Symmetric: the same call encrypts and decrypts.
+    n = len(data)
+    nb = (n + 15) // 16
+    cb = bytearray(nb * 16)             # counter blocks: sid | seq | block index
+    for b in range(nb):
+        cb[16 * b:16 * b + 12] = hdr
+        struct.pack_into('>I', cb, 16 * b + 12, b)
+    ks = _ecb.encrypt(cb)
+    out = bytearray(n)
+    _xor(data, ks, out, n)
+    return out
 
 
 # ---------------- IMA ADPCM ----------------
@@ -222,20 +249,28 @@ def setup():
             sta.config(protocol=network.MODE_11B | network.MODE_11G |
                                 network.MODE_11N | network.MODE_LR)
         sta.config(channel=CHANNEL)
-        if TX_POWER:
-            sta.config(txpower=TX_POWER)
-    except Exception:
-        pass
+    except Exception as ex:
+        print('wifi config failed:', ex)
     e = espnow.ESPNow()
     e.config(rxbuf=2048)
     e.active(True)
     if LONG_RANGE:
         try:
             e.config(rate=0x2A)         # LR 500 kbps, as in the file-transfer project
-        except Exception:
-            pass
+        except Exception as ex:
+            print('LR rate failed:', ex)
     try:
         e.add_peer(BCAST)
+    except Exception:
+        pass
+    if TX_POWER_DBM:
+        try:
+            sta.config(txpower=TX_POWER_DBM)
+        except Exception as ex:
+            print('txpower set failed:', ex)
+    try:
+        print('walkie: channel=%s txpower=%s dBm lr=%s pkt=%d bytes' % (
+            sta.config('channel'), sta.config('txpower'), LONG_RANGE, PKT_LEN))
     except Exception:
         pass
     btn = Pin(BTN, Pin.IN, Pin.PULL_UP)
@@ -258,7 +293,7 @@ def pressed():
 # ---------------- transmit ----------------
 def send_frame(pred, idx):
     global seq, sid
-    if seq >= 0xFFFFFFFF:               # never reuse an IV: new random sid
+    if seq >= 0xFFFFFFFF:               # never reuse a counter block: new random sid
         sid = os.urandom(8)
         seq = 0
     hdr = sid + struct.pack('>I', seq)
@@ -364,4 +399,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
