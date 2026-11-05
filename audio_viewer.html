@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP-NOW Audio Viewer</title>
+<style>
+:root{--bg:#0f1317;--panel:#171d23;--line:#27303a;--fg:#d8e1ea;--dim:#7d8a97;--acc:#2fd3ff;--ok:#4ade80;--warn:#facc15;--bad:#f87171}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,"Segoe UI",sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+h1{font-size:16px;margin:0;font-weight:600;flex:1}
+button,select{background:#202a33;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 12px;font:inherit}
+button{cursor:pointer}button:hover{border-color:var(--acc)}
+button.primary{background:var(--acc);color:#05222b;border-color:var(--acc);font-weight:600}
+button.on{background:var(--bad);border-color:var(--bad);color:#2a0a0a;font-weight:600}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--bad);display:inline-block}
+.dot.on{background:var(--ok)}
+.controls{display:flex;flex-wrap:wrap;gap:14px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line)}
+.controls label{display:flex;gap:6px;align-items:center;color:var(--dim)}
+.controls input[type=range]{width:110px}
+main{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:16px;padding:16px}
+@media(max-width:900px){main{grid-template-columns:1fr}}
+.view{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;min-width:0}
+canvas.big{display:block;width:100%;background:#000;border-radius:4px}
+.cap{display:flex;justify-content:space-between;color:var(--dim);font-size:11px;margin:8px 0 4px;text-transform:uppercase;letter-spacing:.04em}
+.meter{position:relative;height:14px;background:#12171c;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.meter i{position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,var(--ok) 0,var(--ok) 70%,var(--warn) 85%,var(--bad) 100%);background-size:var(--w,100%) 100%}
+.meter b{position:absolute;top:0;bottom:0;width:2px;background:#fff;left:0}
+#info{margin-top:8px;color:var(--dim);font-size:13px}
+#warn{margin-top:8px;color:var(--warn);min-height:20px;font-size:13px}
+.stats{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.card{background:#12171c;border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+.card .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
+.card .v{font-size:18px;font-variant-numeric:tabular-nums;font-weight:600}
+.card.big .v{font-size:26px}
+.spark{margin-top:12px}
+.spark div{font-size:11px;color:var(--dim);margin-top:6px}
+canvas.sp{width:100%;height:46px;background:#12171c;border:1px solid var(--line);border-radius:6px;display:block}
+</style>
+</head>
+<body>
+<header>
+  <h1>ESP-NOW Audio Viewer <span id="fmt" style="color:var(--dim);font-weight:400">-</span></h1>
+  <span class="dot" id="dot"></span><span id="status">Disconnected</span><span id="rawb" style="color:var(--dim)"></span>
+  <button id="btn" class="primary">Connect</button>
+</header>
+
+<div class="controls">
+  <label>Volume <input type="range" id="vol" min="0" max="100" value="80"></label>
+  <label>Input gain <input type="range" id="gain" min="-40" max="40" value="6"><span id="gainv" style="width:42px">6 dB</span></label>
+  <label>Jitter buffer
+    <select id="lat">
+      <option value="60">60 ms</option><option value="120" selected>120 ms</option>
+      <option value="250">250 ms</option><option value="500">500 ms</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="dc" checked> Remove DC (20 Hz high-pass)</label>
+  <button id="mute">Mute</button>
+  <button id="rec">&#9679; Record WAV</button>
+  <button id="reset">Reset stats</button>
+</div>
+
+<main>
+  <section class="view">
+    <div class="cap"><span>Waveform</span><span id="scopeinfo"></span></div>
+    <canvas class="big" id="scope" width="900" height="180"></canvas>
+    <div class="cap"><span>Spectrum</span><span id="specinfo"></span></div>
+    <canvas class="big" id="spec" width="900" height="130"></canvas>
+    <div class="cap"><span>Level</span><span id="lvltxt">-</span></div>
+    <div class="meter"><i id="lvl"></i><b id="pk"></b></div>
+    <div id="info">No stream yet</div>
+    <div id="warn"></div>
+    <details open style="margin-top:10px"><summary style="cursor:pointer;color:var(--dim)">Device console (text printed by the board, e.g. Python errors)</summary><pre id="con" style="max-height:160px;overflow:auto;margin:6px 0 0;padding:8px;background:#0b0f12;border:1px solid var(--line);border-radius:6px;font-size:12px;white-space:pre-wrap"></pre></details>
+  </section>
+  <section class="stats">
+    <div class="grid" id="grid"></div>
+    <div class="spark">
+      <div>Jitter buffer fill, ms (30 s)</div><canvas class="sp" id="spBuf" width="316" height="46"></canvas>
+      <div>RSSI dBm (30 s)</div><canvas class="sp" id="spRssi" width="316" height="46"></canvas>
+      <div>USB KiB/s (30 s)</div><canvas class="sp" id="spUsb" width="316" height="46"></canvas>
+    </div>
+  </section>
+</main>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+
+// ---------- constants (match sender_audio.py / receiver_audio.py) ----------
+// DATA packet from the receiver:  seq_lo, seq_hi, fmt, PCM bytes...
+//   fmt bits 0-3 = index into RATES, bit 4 = 8-bit unsigned (else 16-bit signed LE)
+const RATES = [8000, 10000, 12500, 16000, 20000, 4000, 5000, 6000];   // must match RATES in the sender (adc_audio_tx.py)
+const MAX_DATA_N = 3 + 1467;    // largest DATA payload (ESP-NOW v2: 1470 - 3 header + 3)
+const MAX_GAP = 200;            // a seq jump bigger than this is a restart, not loss
+const DC_HZ = 20;               // corner of the DC-blocking high-pass
+const SCOPE_N = 16384;          // history kept for the scope / spectrum (samples)
+const HIST = 60;                // sparkline samples (500 ms each)
+
+// ---------- audio engine: jitter buffer + adaptive resampler in an AudioWorklet ----------
+// The sender's sample clock is not the PC's sound-card clock.  The worklet keeps the buffer
+// near the chosen fill level by playing a little faster / slower (max +-12 %), so the pitch
+// follows the sender's real sample rate and the buffer never drifts into under/overruns.
+const WORKLET_SRC = `
+class EspPlayer extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.N = 131072; this.ring = new Float32Array(this.N);
+    this.w = 0; this.r = 0; this.rate = 8000; this.target = 960; this.play = false;
+    this.fillF = 0; this.under = 0; this.over = 0; this.blk = 0; this.I = 0;
+    this.port.onmessage = (e) => {
+      const m = e.data;
+      if (m.pcm) {
+        const a = m.pcm, N = this.N; let w = this.w;
+        for (let i = 0; i < a.length; i++) { this.ring[w % N] = a[i]; w++; }
+        this.w = w;
+      } else if (m.cfg) {
+        this.rate = m.cfg.rate;
+        this.target = Math.max(64, Math.round(m.cfg.targetMs * m.cfg.rate / 1000));
+        if (m.cfg.flush) this.reset();
+      } else if (m.flush) this.reset();
+    };
+  }
+  reset() { this.w = 0; this.r = 0; this.play = false; this.fillF = 0; this.I = 0; }
+  report(fill) {
+    if (++this.blk >= 20) {
+      this.blk = 0;
+      this.port.postMessage({fillMs: 1000 * fill / this.rate, under: this.under, over: this.over, play: this.play});
+    }
+  }
+  process(inputs, outputs) {
+    const out = outputs[0][0], n = out.length;
+    let fill = this.w - this.r;
+    if (!this.play) {
+      if (fill >= this.target) { this.play = true; this.fillF = fill; }
+      else { out.fill(0); this.report(fill); return true; }
+    }
+    if (fill > this.target * 4) {                     // far too much queued: jump forward
+      this.r = this.w - this.target; fill = this.target; this.fillF = fill; this.over++;
+    }
+    // PI controller on the buffer fill: P damps, I learns the sender's real clock ratio
+    // (so even a sender running 6 % slow ends up with the buffer sitting at the target).
+    const dt = n / sampleRate, Ts = this.target / this.rate, wn = 0.6;
+    this.fillF += Math.min(1, dt / 0.3) * (fill - this.fillF);      // smooth out packet burstiness
+    const e = (this.fillF - this.target) / this.target;
+    this.I += wn * wn * Ts * e * dt;
+    if (this.I > 0.1) this.I = 0.1; else if (this.I < -0.1) this.I = -0.1;
+    let k = this.I + 2 * 0.7 * wn * Ts * e;
+    if (k > 0.12) k = 0.12; else if (k < -0.12) k = -0.12;
+    const step = (this.rate / sampleRate) * (1 + k);
+    const ring = this.ring, N = this.N, w = this.w;
+    let r = this.r, i = 0;
+    for (; i < n; i++) {
+      if (w - r < step + 1) { this.play = false; this.under++; break; }   // ran dry: re-prebuffer
+      const i0 = Math.floor(r), f = r - i0;
+      const a = ring[i0 % N], b = ring[(i0 + 1) % N];
+      out[i] = a + (b - a) * f;
+      r += step;
+    }
+    for (; i < n; i++) out[i] = 0;
+    this.r = r;
+    this.report(w - r);
+    return true;
+  }
+}
+registerProcessor('esp-player', EspPlayer);
+`;
+
+let actx = null, node = null, outGain = null, audioOk = false;
+const ws = {fillMs: 0, under: 0, over: 0, play: false};   // worklet status
+
+function ensureCtx() {                                    // must run inside the click handler
+  if (actx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  actx = new AC({latencyHint: 'interactive'});
+}
+async function loadWorklet() {
+  if (audioOk) return;
+  if (!actx.audioWorklet) throw new Error('AudioWorklet not supported - use Chrome or Edge');
+  // blob: URLs fail when the page has an opaque origin (file:// or sandboxed frame), so fall back to data:
+  const blobUrl = URL.createObjectURL(new Blob([WORKLET_SRC], {type: 'text/javascript'}));
+  try { await actx.audioWorklet.addModule(blobUrl); }
+  catch (e) {
+    await actx.audioWorklet.addModule('data:text/javascript;charset=utf-8,' + encodeURIComponent(WORKLET_SRC));
+  } finally { URL.revokeObjectURL(blobUrl); }
+  node = new AudioWorkletNode(actx, 'esp-player', {numberOfInputs: 0, outputChannelCount: [1]});
+  outGain = actx.createGain();
+  node.connect(outGain); outGain.connect(actx.destination);
+  node.port.onmessage = e => Object.assign(ws, e.data);
+  audioOk = true;
+  applyVolume(); sendCfg(true);
+}
+function sendCfg(flush) {
+  if (node && stream.rate) node.port.postMessage({cfg: {rate: stream.rate, targetMs: +$('lat').value, flush: !!flush}});
+}
+let muted = false;
+function applyVolume() {
+  if (outGain) outGain.gain.value = muted ? 0 : Math.pow(+$('vol').value / 100, 2);
+}
+
+// ---------- state ----------
+let buf = new Uint8Array(1 << 19), len = 0;
+let port = null, reader = null, connected = false;
+let conBuf = '', conShown = '', connectedAt = 0;
+function junk(b) { if ((b >= 32 && b < 127) || b === 10) { conBuf += String.fromCharCode(b); if (conBuf.length > 4000) conBuf = conBuf.slice(-3000); } }
+
+const stream = {rate: 0, is8: false, spp: 0, expected: -1, x1: 0, y1: 0, R: 0.99, init: true};
+const st = {};
+function resetStats() {
+  Object.assign(st, {usbBytes:0, pkts:0, lost:0, late:0, resync:0, mismatch:0, clip:0, lostBytes:0, audioBytes:0,
+    c3Fwd:0, c3Drops:0, c3UsbFail:0, c3Up:0, rssi:null, lastPkt:0, rawMin:1, rawMax:-1,
+    lvlPeak:0, lvlSq:0, lvlN:0, rmsDb:-120, peakDb:-120, hold:0});
+}
+resetStats();
+
+// scope history (post gain / DC block), at the stream's sample rate
+const scopeBuf = new Float32Array(SCOPE_N);
+let scopeW = 0;
+
+// ---------- recording ----------
+let rec = null;
+function recPush(x) {
+  if (!rec) return;
+  const o = new Int16Array(x.length);
+  for (let i = 0; i < x.length; i++) o[i] = Math.max(-32768, Math.min(32767, Math.round(x[i] * 32767)));
+  rec.chunks.push(o); rec.n += o.length;
+}
+function saveWav() {
+  const r = rec; rec = null;
+  $('rec').classList.remove('on'); $('rec').innerHTML = '&#9679; Record WAV';
+  if (!r || !r.n) return;
+  const data = new DataView(new ArrayBuffer(44 + r.n * 2));
+  const wr = (o, s) => { for (let i = 0; i < s.length; i++) data.setUint8(o + i, s.charCodeAt(i)); };
+  wr(0, 'RIFF'); data.setUint32(4, 36 + r.n * 2, true); wr(8, 'WAVE'); wr(12, 'fmt ');
+  data.setUint32(16, 16, true); data.setUint16(20, 1, true); data.setUint16(22, 1, true);
+  data.setUint32(24, r.rate, true); data.setUint32(28, r.rate * 2, true);
+  data.setUint16(32, 2, true); data.setUint16(34, 16, true); wr(36, 'data'); data.setUint32(40, r.n * 2, true);
+  let off = 44;
+  for (const c of r.chunks) for (let i = 0; i < c.length; i++, off += 2) data.setInt16(off, c[i], true);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([data], {type: 'audio/wav'}));
+  a.download = 'audio_' + Date.now() + '.wav'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// ---------- packet decoding ----------
+function reconfigure(rate, is8) {
+  stream.rate = rate; stream.is8 = is8; stream.expected = -1; stream.init = true;
+  stream.R = 1 - 2 * Math.PI * DC_HZ / rate;
+  scopeBuf.fill(0);
+  $('fmt').textContent = rate + ' Hz, ' + (is8 ? 8 : 16) + '-bit';
+  sendCfg(true);
+}
+// x: Float32Array of finished samples -> scope, level meter, recorder, speaker
+function emit(x) {
+  for (let i = 0; i < x.length; i++) {
+    const v = x[i];
+    scopeBuf[scopeW % SCOPE_N] = v; scopeW++;
+    const a = v < 0 ? -v : v;
+    if (a > st.lvlPeak) st.lvlPeak = a;
+    st.lvlSq += v * v;
+  }
+  st.lvlN += x.length;
+  recPush(x);
+  if (node) node.port.postMessage({pcm: x}, [x.buffer]);   // x is unusable after this
+}
+function onData(o, n) {
+  const seq = buf[o] | (buf[o + 1] << 8), fmt = buf[o + 2], dl = n - 3, po = o + 3;
+  const rate = RATES[fmt & 0x0F], is8 = (fmt & 0x10) !== 0, bps = is8 ? 1 : 2;
+  if (!rate || (fmt & 0xE0) || dl < bps || dl % bps) { st.mismatch++; return; }
+  st.pkts++; st.lastPkt = performance.now(); st.audioBytes += dl;
+  if (rate !== stream.rate || is8 !== stream.is8) reconfigure(rate, is8);
+  const ns = dl / bps;
+  stream.spp = ns;
+
+  // ---- sequence tracking: lost packets become silence so timing is preserved ----
+  if (stream.expected >= 0) {
+    const gap = (seq - stream.expected) & 0xFFFF;
+    if (gap > 0x8000) { st.late++; return; }                // duplicate / reordered: drop
+    if (gap > MAX_GAP) { st.resync++; stream.init = true; }  // sender restarted
+    else if (gap > 0) { st.lost += gap; emit(new Float32Array(gap * ns)); }
+  }
+  stream.expected = (seq + 1) & 0xFFFF;
+
+  // ---- PCM -> float, DC block, gain ----
+  const x = new Float32Array(ns);
+  const dcOn = $('dc').checked, R = stream.R, g = Math.pow(10, +$('gain').value / 20);
+  let x1 = stream.x1, y1 = stream.y1;
+  for (let k = 0; k < ns; k++) {
+    let raw;
+    if (is8) raw = (buf[po + k] - 128) / 128;
+    else raw = (((buf[po + 2 * k] | (buf[po + 2 * k + 1] << 8)) << 16) >> 16) / 32768;
+    if (raw < st.rawMin) st.rawMin = raw;
+    if (raw > st.rawMax) st.rawMax = raw;
+    if (stream.init) { x1 = raw; y1 = 0; stream.init = false; }
+    let y;
+    if (dcOn) { y = raw - x1 + R * y1; y1 = y; } else { y = raw; y1 = 0; }
+    x1 = raw;
+    y *= g;
+    if (y > 1) { y = 1; st.clip++; } else if (y < -1) { y = -1; st.clip++; }
+    x[k] = y;
+  }
+  stream.x1 = x1; stream.y1 = y1;
+  if (rec && !rec.rate) rec.rate = rate;
+  emit(x);
+}
+function onStats(o) {
+  const dv = new DataView(buf.buffer, buf.byteOffset + o, 15);
+  const r = dv.getInt8(0);
+  st.rssi = r === -128 ? null : r;
+  st.c3Fwd = dv.getUint32(1, true);
+  st.c3Drops = dv.getUint32(5, true);
+  st.c3Up = dv.getUint32(9, true);
+  st.c3UsbFail = dv.getUint16(13, true);
+}
+
+// ---------- USB stream parser:  AA 55 type n_lo n_hi payload ----------
+function parse() {
+  let p = 0;
+  for (;;) {
+    while (p + 1 < len && !(buf[p] === 0xAA && buf[p + 1] === 0x55)) { junk(buf[p]); p++; st.lostBytes++; }
+    if (p + 5 > len) break;
+    const type = buf[p + 2], n = buf[p + 3] | (buf[p + 4] << 8);
+    const ok = (type === 1 && n >= 4 && n <= MAX_DATA_N) || (type === 2 && n === 15);
+    if (!ok) { junk(buf[p]); p++; st.lostBytes++; continue; }
+    if (p + 5 + n > len) break;
+    if (type === 1) onData(p + 5, n); else onStats(p + 5);
+    p += 5 + n;
+  }
+  if (p > 0) { buf.copyWithin(0, p, len); len -= p; }
+}
+function ingest(chunk) {
+  if (len + chunk.length > buf.length) {
+    const nb = new Uint8Array(Math.max(buf.length * 2, len + chunk.length));
+    nb.set(buf.subarray(0, len)); buf = nb;
+  }
+  buf.set(chunk, len); len += chunk.length;
+  st.usbBytes += chunk.length;
+  parse();
+}
+
+// ---------- transport: WebUSB on Android, Web Serial on desktop ----------
+const useUSB = !!navigator.usb && (!navigator.serial || /Android/i.test(navigator.userAgent));
+let dev = null, inEp = 0, ctrlN = 0, dataN = 0, wake = null;
+
+async function openUsb() {
+  dev = await navigator.usb.requestDevice({filters: []});     // pick the ESP32 in the chooser
+  await dev.open();
+  if (!dev.configuration) await dev.selectConfiguration(1);
+  let ctrl = null, data = null;
+  for (const i of dev.configuration.interfaces) {
+    const c = i.alternates[0].interfaceClass;
+    if (c === 0x02) ctrl = i.interfaceNumber;                 // CDC control
+    if (c === 0x0A) data = i;                                 // CDC data
+  }
+  if (ctrl === null || !data) {
+    await dev.close(); dev = null;
+    throw new Error('No CDC serial interface - use the ESP32 native USB port');
+  }
+  await dev.claimInterface(ctrl);
+  await dev.claimInterface(data.interfaceNumber);
+  inEp = data.alternates[0].endpoints.find(e => e.direction === 'in').endpointNumber;
+  ctrlN = ctrl; dataN = data.interfaceNumber;
+  // DTR + RTS, same as setSignals() on desktop
+  await dev.controlTransferOut({requestType: 'class', recipient: 'interface', request: 0x22, value: 0x03, index: ctrl});
+}
+async function usbReadLoop() {
+  while (connected && dev) {
+    try {
+      const r = await dev.transferIn(inEp, 4096);
+      if (r.status === 'stall') { await dev.clearHalt('in', inEp); continue; }
+      if (r.data && r.data.byteLength) ingest(new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength));
+    } catch (e) {
+      if (connected) setStatus('Read error: ' + e.message, false);
+      break;
+    }
+  }
+}
+async function lockScreen() { try { if (navigator.wakeLock) wake = await navigator.wakeLock.request('screen'); } catch (_) {} }
+document.addEventListener('visibilitychange', () => { if (connected && document.visibilityState === 'visible') lockScreen(); });
+
+let audioErr = '';
+async function connect() {
+  try { ensureCtx(); } catch (e) { audioErr = 'Audio unavailable: ' + e.message; }   // inside the user gesture
+  try {
+    if (useUSB) await openUsb();
+    else {
+      port = await navigator.serial.requestPort();
+      await port.open({baudRate: 115200, bufferSize: 1 << 20});
+      try { await port.setSignals({dataTerminalReady: true, requestToSend: true}); } catch (_) {}
+    }
+  } catch (e) { setStatus('Open failed: ' + e.message, false); port = null; dev = null; return; }
+  connected = true; len = 0; stream.expected = -1; stream.init = true; connectedAt = performance.now();
+  setStatus('Connected', true); $('btn').textContent = 'Disconnect';
+  lockScreen();
+  if (actx) {
+    try { await actx.resume(); await loadWorklet(); audioErr = ''; }
+    catch (e) { audioErr = 'Audio output failed: ' + e.message; }
+  }
+  if (node) node.port.postMessage({flush: true});
+  if (useUSB) await usbReadLoop();
+  else {
+    while (port && port.readable && connected) {
+      reader = port.readable.getReader();
+      try {
+        for (;;) {
+          const {value, done} = await reader.read();
+          if (done) break;
+          if (value && value.length) ingest(value);
+        }
+      } catch (e) { setStatus('Read error: ' + e.message, false); }
+      finally { try { reader.releaseLock(); } catch (_) {} reader = null; }
+      if (!connected) break;
+      await new Promise(r => setTimeout(r, 100));
+      if (!port.readable) break;
+    }
+  }
+  await cleanup();
+}
+async function cleanup() {
+  connected = false;
+  if (rec) saveWav();
+  try {
+    if (useUSB) {
+      if (dev) { try { await dev.releaseInterface(dataN); await dev.releaseInterface(ctrlN); } catch (_) {} await dev.close(); }
+    } else {
+      try { if (reader) await reader.cancel(); } catch (_) {}
+      if (port) await port.close();
+    }
+  } catch (_) {}
+  dev = null; port = null;
+  if (node) node.port.postMessage({flush: true});
+  try { if (wake) { await wake.release(); wake = null; } } catch (_) {}
+  setStatus('Disconnected', false); $('btn').textContent = 'Connect';
+}
+function setStatus(t, on) { $('status').textContent = t; $('dot').className = 'dot' + (on ? ' on' : ''); }
+
+$('btn').onclick = async () => {
+  if (connected) {
+    connected = false;
+    if (useUSB) { if (dev) dev.close().catch(() => {}); }          // aborts the pending read
+    else { try { if (reader) await reader.cancel(); } catch (_) {} }
+  } else connect();
+};
+if (!useUSB && !('serial' in navigator)) {
+  $('btn').disabled = true;
+  setStatus('Use Chrome or Edge (Web Serial / WebUSB not available)', false);
+}
+if (navigator.usb) navigator.usb.addEventListener('disconnect', () => { connected = false; });
+if (navigator.serial) navigator.serial.addEventListener('disconnect', () => { connected = false; });
+
+// ---------- controls ----------
+$('vol').oninput = applyVolume;
+$('gain').oninput = () => { $('gainv').textContent = $('gain').value + ' dB'; };
+$('lat').onchange = () => sendCfg(false);
+$('mute').onclick = () => { muted = !muted; $('mute').textContent = muted ? 'Unmute' : 'Mute'; applyVolume(); };
+$('rec').onclick = () => {
+  if (rec) { saveWav(); return; }
+  rec = {chunks: [], n: 0, rate: stream.rate};
+  $('rec').classList.add('on'); $('rec').textContent = '\u25A0 Stop & save';
+};
+$('reset').onclick = () => {
+  resetStats(); ws.under = ws.over = 0;
+  if (node) node.port.postMessage({cfg: {rate: stream.rate || 8000, targetMs: +$('lat').value}});
+  hist.buf.length = hist.rssi.length = hist.usb.length = 0;
+};
+
+// ---------- scope + spectrum ----------
+const scope = $('scope'), sctx = scope.getContext('2d');
+const spec = $('spec'), pctx = spec.getContext('2d');
+const FFT_N = 1024;
+const win = new Float64Array(FFT_N).map((_, i) => 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (FFT_N - 1)));
+const fre = new Float64Array(FFT_N), fim = new Float64Array(FFT_N);
+const rev = new Uint16Array(FFT_N);
+for (let i = 0; i < FFT_N; i++) { let r = 0; for (let b = 0, v = i; b < 10; b++, v >>= 1) r = (r << 1) | (v & 1); rev[i] = r; }
+function fft() {                                                // in-place radix-2 on fre/fim
+  for (let i = 0; i < FFT_N; i++) { const j = rev[i]; if (j > i) { let t = fre[i]; fre[i] = fre[j]; fre[j] = t; t = fim[i]; fim[i] = fim[j]; fim[j] = t; } }
+  for (let sz = 2; sz <= FFT_N; sz <<= 1) {
+    const h = sz >> 1, ang = -2 * Math.PI / sz;
+    for (let s = 0; s < FFT_N; s += sz) for (let k = 0; k < h; k++) {
+      const c = Math.cos(ang * k), sn = Math.sin(ang * k), a = s + k, b = a + h;
+      const tr = fre[b] * c - fim[b] * sn, ti = fre[b] * sn + fim[b] * c;
+      fre[b] = fre[a] - tr; fim[b] = fim[a] - ti; fre[a] += tr; fim[a] += ti;
+    }
+  }
+}
+const specSmooth = new Float64Array(FFT_N / 2).fill(-120);
+function drawScope() {
+  const w = scope.width, h = scope.height, rate = stream.rate;
+  sctx.fillStyle = '#000'; sctx.fillRect(0, 0, w, h);
+  sctx.strokeStyle = '#27303a'; sctx.lineWidth = 1; sctx.beginPath();
+  sctx.moveTo(0, h / 2); sctx.lineTo(w, h / 2); sctx.stroke();
+  if (!rate || scopeW < 2048) return;
+  const show = Math.min(SCOPE_N - 2048, Math.round(rate * 0.12));   // ~120 ms window
+  let start = scopeW - show - 1024;                                  // look back for a rising zero crossing
+  for (let i = start; i < scopeW - show; i++) {
+    if (scopeBuf[i % SCOPE_N] <= 0 && scopeBuf[(i + 1) % SCOPE_N] > 0) { start = i; break; }
+  }
+  start = Math.min(start, scopeW - show);
+  sctx.strokeStyle = '#2fd3ff'; sctx.lineWidth = 1.5; sctx.beginPath();
+  for (let i = 0; i < show; i++) {
+    const v = scopeBuf[(start + i) % SCOPE_N];
+    const x = i * (w - 1) / (show - 1), y = h / 2 - v * (h / 2 - 2);
+    i ? sctx.lineTo(x, y) : sctx.moveTo(x, y);
+  }
+  sctx.stroke();
+  $('scopeinfo').textContent = (show * 1000 / rate).toFixed(0) + ' ms window, full scale = +-1';
+}
+function drawSpec() {
+  const w = spec.width, h = spec.height, rate = stream.rate;
+  pctx.fillStyle = '#000'; pctx.fillRect(0, 0, w, h);
+  if (!rate || scopeW < FFT_N) return;
+  for (let i = 0; i < FFT_N; i++) { fre[i] = scopeBuf[(scopeW - FFT_N + i) % SCOPE_N] * win[i]; fim[i] = 0; }
+  fft();
+  const bins = FFT_N / 2, bw = w / bins;
+  pctx.fillStyle = '#4ade80';
+  for (let k = 0; k < bins; k++) {
+    const mag = Math.hypot(fre[k], fim[k]) / (FFT_N / 4);          // ~ amplitude of a sine, full scale = 1
+    const db = 20 * Math.log10(mag + 1e-9);
+    specSmooth[k] = db > specSmooth[k] ? db : specSmooth[k] * 0.85 + db * 0.15;
+    const frac = Math.max(0, Math.min(1, (specSmooth[k] + 90) / 90));   // -90..0 dBFS
+    pctx.fillRect(k * bw, h - frac * h, Math.max(1, bw), frac * h);
+  }
+  pctx.fillStyle = '#7d8a97'; pctx.font = '11px system-ui';
+  for (const f of [0, 0.25, 0.5, 0.75]) pctx.fillText(Math.round(rate / 2 * f) + ' Hz', Math.max(2, f * w + 2), 11);
+  pctx.textAlign = 'right'; pctx.fillText(Math.round(rate / 2) + ' Hz', w - 2, 11); pctx.textAlign = 'left';
+  $('specinfo').textContent = (rate / FFT_N).toFixed(1) + ' Hz / bin';
+}
+function frame() { drawScope(); drawSpec(); requestAnimationFrame(frame); }
+requestAnimationFrame(frame);
+
+// ---------- statistics UI ----------
+const FIELDS = [
+  ['rms','Level (dBFS)','big'], ['rssi','RSSI (dBm)','big'],
+  ['pps','Packets / s'], ['usb','USB KiB / s'],
+  ['kbps','Audio kbit/s'], ['rate','Sample rate'],
+  ['pkts','Packets'], ['lost','Packets lost'],
+  ['losspct','Lost %'], ['buf','Jitter buffer ms'],
+  ['under','Underruns'], ['over','Overruns'],
+  ['clip','Clipped samples'], ['resync','Stream restarts'],
+  ['late','Late / dup pkts'], ['mismatch','Mismatched pkts'],
+  ['c3fwd','C3 forwarded pkts'], ['c3drop','C3 rx drops'],
+  ['c3fail','C3 USB fails'], ['usbsync','USB resync bytes'],
+  ['age','Last pkt age'], ['up','C3 uptime']
+];
+const els = {};
+for (const [id, label, cls] of FIELDS) {
+  const d = document.createElement('div');
+  d.className = 'card ' + (cls || '');
+  d.innerHTML = '<div class="k">' + label + '</div><div class="v" id="v_' + id + '">-</div>';
+  $('grid').appendChild(d);
+  els[id] = $('v_' + id);
+}
+const hist = {buf: [], rssi: [], usb: []};
+const samples = [];
+function rateOf(key) {
+  if (samples.length < 2) return 0;
+  const a = samples[0], b = samples[samples.length - 1];
+  return (b[key] - a[key]) / ((b.t - a.t) / 1000);
+}
+function spark(canvas, arr, lo, hi, color) {
+  const c = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
+  c.clearRect(0, 0, w, h);
+  if (arr.length < 2) return;
+  c.strokeStyle = color; c.lineWidth = 1.5; c.beginPath();
+  arr.forEach((v, i) => {
+    const x = (HIST - arr.length + i) * (w - 1) / (HIST - 1);
+    const y = h - 2 - (Math.min(Math.max(v, lo), hi) - lo) / (hi - lo) * (h - 4);
+    i ? c.lineTo(x, y) : c.moveTo(x, y);
+  });
+  c.stroke();
+}
+function push(a, v) { a.push(v); if (a.length > HIST) a.shift(); }
+const fmtN = n => n.toLocaleString('en-US');
+const toDb = v => v > 1e-6 ? 20 * Math.log10(v) : -120;
+
+// level meter updates faster than the stats table
+setInterval(() => {
+  if (st.lvlN) {
+    st.rmsDb = toDb(Math.sqrt(st.lvlSq / st.lvlN));
+    const pk = toDb(st.lvlPeak);
+    st.peakDb = pk > st.peakDb ? pk : st.peakDb - 3;                 // peak hold with decay
+    st.lvlSq = 0; st.lvlN = 0; st.lvlPeak = 0;
+  } else st.peakDb -= 3;
+  const f = db => Math.max(0, Math.min(1, (db + 60) / 60));
+  $('lvl').style.width = (f(st.rmsDb) * 100) + '%';
+  $('lvl').style.setProperty('--w', (100 / Math.max(f(st.rmsDb), 0.01)) + '%');
+  $('pk').style.left = 'calc(' + (f(st.peakDb) * 100) + '% - 2px)';
+  $('lvltxt').textContent = 'RMS ' + Math.round(st.rmsDb) + ' dBFS   peak ' + Math.round(st.peakDb) + ' dBFS';
+}, 100);
+
+setInterval(() => {
+  const now = performance.now();
+  samples.push({t: now, pkts: st.pkts, usb: st.usbBytes, audio: st.audioBytes});
+  if (samples.length > 5) samples.shift();
+
+  const pps = rateOf('pkts'), usb = rateOf('usb') / 1024, abps = rateOf('audio');
+  const rssiCol = st.rssi === null ? 'var(--dim)' : st.rssi >= -60 ? 'var(--ok)' : st.rssi >= -75 ? 'var(--warn)' : 'var(--bad)';
+  const total = st.pkts + st.lost;
+
+  els.rms.textContent = Math.round(st.rmsDb);
+  els.rssi.textContent = st.rssi === null ? '--' : st.rssi;
+  els.rssi.style.color = rssiCol;
+  els.pps.textContent = pps.toFixed(0);
+  els.usb.textContent = usb.toFixed(1);
+  els.kbps.textContent = (abps * 8 / 1000).toFixed(0);
+  els.rate.textContent = stream.rate ? stream.rate + ' Hz' : '-';
+  els.pkts.textContent = fmtN(st.pkts);
+  els.lost.textContent = fmtN(st.lost);
+  els.losspct.textContent = total ? (100 * st.lost / total).toFixed(1) + ' %' : '-';
+  els.buf.textContent = audioOk ? ws.fillMs.toFixed(0) : '-';
+  els.under.textContent = fmtN(ws.under);
+  els.over.textContent = fmtN(ws.over);
+  els.clip.textContent = fmtN(st.clip);
+  els.resync.textContent = fmtN(st.resync);
+  els.late.textContent = fmtN(st.late);
+  els.mismatch.textContent = fmtN(st.mismatch);
+  els.c3fwd.textContent = fmtN(st.c3Fwd);
+  els.c3drop.textContent = fmtN(st.c3Drops);
+  els.c3fail.textContent = fmtN(st.c3UsbFail);
+  els.usbsync.textContent = fmtN(st.lostBytes);
+  els.age.textContent = st.lastPkt ? ((now - st.lastPkt) / 1000).toFixed(1) + ' s' : '-';
+  els.up.textContent = st.c3Up ? Math.floor(st.c3Up / 1000) + ' s' : '-';
+
+  $('info').textContent = stream.rate
+    ? stream.rate + ' Hz  |  ' + (stream.is8 ? '8-bit' : '16-bit') + ' mono  |  ' + stream.spp + ' samples ('
+      + (1000 * stream.spp / stream.rate).toFixed(1) + ' ms) per packet  |  lost packets are replaced by silence'
+    : 'No stream yet';
+  $('rawb').textContent = connected ? '  |  ' + fmtN(st.usbBytes) + ' bytes received' : '';
+  if (conBuf !== conShown) { conShown = conBuf; const c = $('con'); c.textContent = conBuf; c.scrollTop = c.scrollHeight; }
+  if (rec) $('rec').textContent = '\u25A0 Stop & save  ' + (rec.n / (rec.rate || stream.rate || 1)).toFixed(1) + ' s';
+
+  const flat = st.rawMax - st.rawMin;
+  let w = '';
+  if (connected && st.usbBytes === 0 && now - connectedAt > 3000)
+    w = 'Connected, but 0 bytes received from the board. Is receiver_audio.py saved as main.py? Try pressing the board RESET button, close Thonny, or replug USB.';
+  else if (connected && st.mismatch > 20 && pps === 0)
+    w = 'Packets arrive but do not look like the audio stream (is the sender running sender_audio.py, not a video sender?).';
+  else if (connected && st.lastPkt && now - st.lastPkt > 2000)
+    w = 'No audio packets for ' + ((now - st.lastPkt) / 1000).toFixed(0) + ' s - check the sender and the ESP-NOW link.';
+  else if (connected && !st.lastPkt && st.c3Up)
+    w = 'Receiver is connected but no audio packets have arrived yet.';
+  else if (audioErr)
+    w = audioErr;
+  else if (connected && st.pkts > 50 && flat >= 0 && flat < (stream.is8 ? 0.008 : 0.0006) && now - st.lastPkt < 1000)
+    w = 'The ADC input is flat (no variation at all). Check the mic wiring and supply, and that MIC_PIN is an ADC1 pin.';
+  else if (connected && audioOk && ws.under > 5 && ws.under > st.pkts / 200)
+    w = 'The jitter buffer keeps running dry. Increase it, or improve the link (see RSSI / packets lost).';
+  else if (connected && st.clip > 50 && st.clip > st.pkts)
+    w = 'The signal is clipping. Lower the input gain (or the gain on the mic module).';
+  $('warn').textContent = w;
+  // reset the per-interval min/max used for the flat-input check
+  st.rawMin = 1; st.rawMax = -1;
+
+  push(hist.buf, audioOk ? ws.fillMs : 0); push(hist.usb, usb); push(hist.rssi, st.rssi === null ? -100 : st.rssi);
+  spark($('spBuf'), hist.buf, 0, Math.max(100, ...hist.buf) * 1.2, '#2fd3ff');
+  spark($('spRssi'), hist.rssi, -100, -20, '#4ade80');
+  spark($('spUsb'), hist.usb, 0, Math.max(10, ...hist.usb) * 1.2, '#facc15');
+}, 500);
+</script>
+</body>
+</html>
